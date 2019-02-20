@@ -1,4 +1,7 @@
-''
+
+
+
+
 
 import os
 
@@ -32,6 +35,9 @@ bucket = gcs_client.get_bucket(bucket_name)
 qblob1, qblob2, qblob3 = bucket.get_blob("queries/query1.txt"), bucket.get_blob("queries/query2.txt") , bucket.get_blob("queries/query3.txt")
 query1, query2, query3 = qblob1.download_as_string().decode('utf-8').strip(), qblob2.download_as_string().decode('utf-8').strip(), qblob3.download_as_string().decode('utf-8').strip()
 listOfQueries = [query1,query2,query3]
+
+
+
 
 '''
 bigTable_id, bigTableInstance_id = os.environ['tableBigTableId'],os.environ['InstanceBigTableId']
@@ -88,10 +94,12 @@ Python callable API_PythonCallable assumptions :
 '''
 
 
+apiDownloadPath, decompressedPath = os.path.join(os.path.realpath(__file__),'API_Download') , os.path.join(os.path.realpath(__file__),'Decompressed')
+
 
 for cc in sample_cc:
 	current_time = datetime.today().strftime("%Y%m%d_%H_%M")
-	output_t2 = os.path.join(os.path.realpath(__file__),'API_Download',cc,current_time)
+	output_t2 = os.path.join(apiDownloadPath,cc,current_time)
 	t2 = PythonOperator(task_id="dataPull_{}_{}".format(cc,current_time),
 		                python_callable=API_PythonCallable,
 		                op_kwargs={"country_code":cc,
@@ -112,26 +120,31 @@ NOTE :
 '''
 
 
-
+# t2_US >> t3_US , t2_CA >> t3_CA
 for cc , input_t3 , t2  in zip(sample_cc, filePaths_t2, dataIngestionTask):
 	current_time = datetime.today().strftime("%Y%m%d_%H_%M")
-	output_t3 = os.path.join(os.path.realpath(__file__),'Decompressed',cc,current_time) 
+	output_t3 = os.path.join(decompressedPath,cc,current_time) 
 	t3 = BashOperator(task_id='decompress_ApiData_{}'.format(cc),
 	bash_command="python decompression.py --inputPath {} --outputPath{}".format(input_t3, output_t3),
 	dag=dag)
-	# t2_US >> t3_US , t2_CA >> t3_CA
 	t3.set_upstream(t2)
 	decompressionTask.append(t3)
 	filePaths_t3.append(output_t3)
 
 
+'''
+Writing temporarily from FileSystem to Cloud Storage
+
+t3_CA >> t4_CA  in GCS
+'''
+
 writeToGCS_task, tempGCS_dir_paths = [] , [] 
+current_time = datetime.today().strftime("%Y%m%d_%H_%M") 
+tempGCS_dir_temp="gs://{}/temp/{}".format(bucket_name,current_time)
 
 for cc , input_t4 , t3 in zip(sample_cc,filePaths_t3, decompressionTask):
 	current_time = datetime.today().strftime("%Y%m%d_%H_%M") 
-	tempGCS_dir_temp="gs://{}/temp/{}".format(bucket_name,current_time)
 	GCS_dir_archive = "gs://{}/archive/{}/{}".format(bucket_name,cc,current_time)
-	globals()['GCS_tempDataPath'] = tempGCS_dir_temp  # setting path variable to delete at the end of DAG
 	tempGCS_filepath = os.path.join(tempGCS_dir_temp,cc)
 	t4 = FileToGoogleCloudStorageOperator(task_id='uploadToGCS_{}'.format(cc),
 		src=input_t4,
@@ -150,10 +163,35 @@ for cc , input_t4 , t3 in zip(sample_cc,filePaths_t3, decompressionTask):
 	writeToGCS_task.append(t4)
 	tempGCS_dir_paths.append(tempGCS_filepath)
 
+
+
 schema = None  # remember to enter schema!
+
+'''
+Creating dummy task to merge next set of nodes
+'''
 
 dummy_task = DummyOperator(task_id="forkMerge",
 	dag=dag)
+
+'''
+Checking to see if external BQ table exists
+
+Case : Table Exists 
+-- write data to bigtable table using URI's for temporary GCS files
+-- set dummy operator downstream
+
+
+[t4_US,t4_CA,...] >> t5_prime >> t6_dummy
+
+Case : Table Doesnt Exist
+-- Create table and automatically pull in temporary GCS files
+-- set dummy operator downstream
+
+[t4_US,t4_CA,...] >> t5_gamma >> t6_dummy
+
+
+'''
 
 try : 
 	t5_prime_tableCheck=BigQueryCheckOperator(task_id='checkForTable',
@@ -182,6 +220,14 @@ except Exception as e :
 	dummy_task.set_upstream(t5_gamme_tableCreate)
 
 
+'''
+Read in queries stored in GCS bucket
+
+t5_(gamma,prime) >> t6_(uploadToBQ_TableExists, CreateTableBQ_UploadtoBQ) >> t7_dummy >> [t8_query1Result_BQTable,...]
+
+Note : Storing it all in one dataset and deleting dataset at the end!
+
+'''
 
 query_tasks, tempAggtables_list = [] , []
 count = 1
@@ -202,8 +248,16 @@ for query in listOfQueries:
 	count += 1
 
 
+'''
+Exporting BigQuery aggregation query results from tables
+
+[t8_query1Result_BQTable,...] >> [t9_query1Result_GCS,...]
+
+'''
+
 AggbigQueryToGCS_tasks , bigTableInputs = [] , [] 
 count=1
+aggQuery_tempFolder_gcs = "gs://{}/aggQuery".format(bucket_name)
 for aggQuery,table in zip(query_tasks,tempAggtables_list): 
 	current_time = datetime.today().strftime("%Y%m%d_%H_%M")
 	gcsDestURI = "gs://{}/aggQuery/{}/current_time".format(bucket_name,str(count))
@@ -218,14 +272,36 @@ for aggQuery,table in zip(query_tasks,tempAggtables_list):
 	count+=1
 
 
-
+'''
+[t9_query1Result_GCS,...] >> t10_UploadToBigTable
+'''
 storageToBigTable_task = PythonOperator(task_id='UploadTObigTable_{}'.format(datetime.today().strftime("%Y%m%d_%H_%M")),
 	python_callable=uploadToBigTable,
-	op_args=*bigTableInputs,
+	op_args=bigTableInputs,
 	dag=dag)
 
 
 
+
+
+# Using gcs client to delete blob via a python callable
+def deleleGCSdata(*gcsDeleteData):
+	global bucket
+	for path in gcsDeleteData:
+		blob = bucket.get_blob(path)
+		blob.delete()
+
+# path to temporary GCS decompressed files (t3 >> t4 )and path to GCS aggregated query result (t8 >> t9)
+deletePaths = [aggQuery_tempFolder_gcs , tempGCS_dir_temp]
+
+'''
+CLean up tasks : 
+	-- deleting GCS temporary stored data (from Aggregation Queries to BigTable staging and decompressed API data from local filesystem;not the Archived API data!!)
+	-- local filesystem data from API download and decompression
+    -- deleting BigQuery dataset hosting aggregation query results and initial decompressed API data upload from GCS 
+
+t10_UploadToBigTable >> [t11_cleanBQ, t11_cleanGCS, t11_cleanLocalFS]
+'''
 
 BigQueryCLeanUp_task = BigQueryDeleteDatasetOperator(task_id='DeleteHostingBQDataset_{}'.format(datetime.today().strftime("%Y%m%d_%H_%M")),
 	dataset_id=dataset_id,
@@ -235,23 +311,29 @@ BigQueryCLeanUp_task = BigQueryDeleteDatasetOperator(task_id='DeleteHostingBQDat
 
 
 
-def deleleGCSdata(tempGCS_dir_temp):
-	global bucket
-	blob = bucket.get_blob(tempGCS_dir_temp)
-	blob.delete()
-
 GCSCleanUp_task = PythonOperator(task_id="deleteGCStempData_{}".format(datetime.today().strftime("%Y%m%d_%H_%M")),
 	python_callable=deleleGCSdata,
-	op_args=tempGCS_dir_paths,
+	op_args=deletePaths ,
+	dag=dag)
+ 
+localFSCLeanUp_task = BashOperator(task_id='deleteLocalFS_{}'.format(datetime.today().strftime("%Y%m%d_%H_%M")),
+	bash_command="rm -r {} && rm -r {}".format(apiDownloadPath, decompressedPath),
 	dag=dag)
 
 
-Finish_task = BashOperator(task_id='Finish_task',
-	bash_command="echo 'Finished pipeline on $(date)' ".format(str(numOfcc)),
+'''
+Priniting final task completion
+[t11_cleanBQ, t11_cleanGCS, t11_cleanLocalFS] >> t12_finished
+'''
+
+Finish_task = BashOperator(task_id='Finish_task_{}'.format(datetime.today().strftime("%Y%m%d_%H_%M")),
+	bash_command="echo 'Finished pipeline on $(date)' ",
 	dag=dag)
 
 
-AggbigQueryToGCS_tasks >> storageToBigTable_task >> [GCSCleanUp_task, BigQueryCLeanUp_task ] >> Finish_task
+
+
+AggbigQueryToGCS_tasks >> storageToBigTable_task >> [GCSCleanUp_task, BigQueryCLeanUp_task, localFSCLeanUp_task ] >> Finish_task
 
 
 
