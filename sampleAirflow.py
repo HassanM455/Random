@@ -274,6 +274,8 @@ for aggQuery,table in zip(query_tasks,tempAggtables_list):
 
 '''
 [t9_query1Result_GCS,...] >> t10_UploadToBigTable
+Importing a python callable that will assit in uploading data stored in GCS to BigTable
+	-- The callable takes as a value the URI's for the temporary aggregated data sitting in GCS bucket
 '''
 storageToBigTable_task = PythonOperator(task_id='UploadTObigTable_{}'.format(datetime.today().strftime("%Y%m%d_%H_%M")),
 	python_callable=uploadToBigTable,
